@@ -145,7 +145,8 @@ impl ExecutionPlan for AvroExec {
             .object_store(&self.base_config.object_store_url)?;
 
         let config = Arc::new(private::AvroConfig {
-            schema: Arc::clone(&self.base_config.file_schema),
+            file_schema: Arc::clone(&self.base_config.file_schema),
+            projected_schema: self.projected_schema.clone(),
             batch_size: context.session_config().batch_size(),
             projection: self.base_config.projected_file_column_names(),
             object_store,
@@ -169,30 +170,101 @@ impl ExecutionPlan for AvroExec {
 #[cfg(feature = "avro")]
 mod private {
     use super::*;
-    use crate::datasource::avro_to_arrow::Reader as AvroReader;
     use crate::datasource::physical_plan::file_stream::{FileOpenFuture, FileOpener};
     use crate::datasource::physical_plan::FileMeta;
 
-    use bytes::Buf;
-    use futures::StreamExt;
-    use object_store::{GetResultPayload, ObjectStore};
+    use futures::{StreamExt, TryStreamExt};
+    use object_store::ObjectStore;
+    use futures_util::FutureExt;
 
     pub struct AvroConfig {
-        pub schema: SchemaRef,
+        pub file_schema: SchemaRef,
+        pub projected_schema: SchemaRef,
         pub batch_size: usize,
         pub projection: Option<Vec<String>>,
         pub object_store: Arc<dyn ObjectStore>,
     }
 
-    impl AvroConfig {
-        fn open<R: std::io::Read>(&self, reader: R) -> Result<AvroReader<'static, R>> {
-            AvroReader::try_new(
-                reader,
-                self.schema.clone(),
-                self.batch_size,
-                self.projection.clone(),
-            )
-        }
+    pub async fn build_avro_arrow2_stream_inner(
+        config: Arc<AvroConfig>,
+        file_meta: FileMeta,
+    ) -> Result<
+        impl futures::Stream<
+            Item = Result<arrow_array::RecordBatch, arrow::error::ArrowError>,
+        >,
+    > {
+        use arrow2::io::avro::avro_schema::file::Block;
+        use arrow2::io::avro::avro_schema::read_async::{
+            block_stream, decompress_block, read_metadata,
+        };
+        use arrow2::io::avro::read::deserialize;
+
+        let mut stream = config
+            .object_store
+            .get(file_meta.location())
+            .await?
+            .into_stream()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .into_async_read();
+        let metadata = read_metadata(&mut stream)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let metadata = Arc::new(metadata);
+
+        let arrow2_projection: Vec<bool> = if let Some(projection) = &config.projection {
+            config
+                .file_schema
+                .fields()
+                .iter()
+                .map(|f| projection.iter().any(|p| p == f.name()))
+                .collect()
+        } else {
+            config.file_schema.fields().iter().map(|_| true).collect()
+        };
+
+        let arrow2_schema_fields = config
+            .file_schema
+            .fields
+            .into_iter()
+            .map(|f| arrow2::datatypes::Field::from(f))
+            .collect::<Vec<_>>();
+        let arrow2_schema: arrow2::datatypes::Schema = arrow2_schema_fields.into();
+        let arrow2_schema = Arc::new(arrow2_schema);
+
+        let ret = async_stream::try_stream! {
+            let blocks = block_stream(&mut stream, metadata.marker).await;
+            futures::pin_mut!(blocks);
+            while let Some(mut block) = blocks.next().await.transpose().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))? {
+                let schema = arrow2_schema.clone();
+                let metadata = metadata.clone();
+                let projection = arrow2_projection.clone();
+                // the content here is CPU-bounded. It should run on a dedicated thread pool
+                let handle = tokio::task::spawn_blocking(move || {
+                    let mut decompressed = Block::new(0, vec![]);
+                    decompress_block(&mut block, &mut decompressed, metadata.compression)?;
+                    deserialize(
+                        &decompressed,
+                        &schema.fields,
+                        &metadata.record.fields,
+                        &projection,
+                    )
+                });
+                let chunk = handle.await.map_err(|e| {
+                    arrow::error::ArrowError::from_external_error(Box::new(e))
+                })?.map_err(|e| {
+                    arrow::error::ArrowError::from_external_error(Box::new(e))
+                })?;
+                let arrow_arrs: Vec<arrow_array::ArrayRef> = chunk
+                    .into_arrays()
+                    .into_iter()
+                    .map(|arr| arr.into())
+                    .collect::<Vec<_>>();
+                let batch = arrow_array::RecordBatch::try_new(config.projected_schema.clone(), arrow_arrs)?;
+                yield batch;
+            };
+        };
+
+        Ok(ret)
     }
 
     pub struct AvroOpener {
@@ -202,20 +274,13 @@ mod private {
     impl FileOpener for AvroOpener {
         fn open(&self, file_meta: FileMeta) -> Result<FileOpenFuture> {
             let config = self.config.clone();
-            Ok(Box::pin(async move {
-                let r = config.object_store.get(file_meta.location()).await?;
-                match r.payload {
-                    GetResultPayload::File(file, _) => {
-                        let reader = config.open(file)?;
-                        Ok(futures::stream::iter(reader).boxed())
-                    }
-                    GetResultPayload::Stream(_) => {
-                        let bytes = r.bytes().await?;
-                        let reader = config.open(bytes.reader())?;
-                        Ok(futures::stream::iter(reader).boxed())
-                    }
-                }
-            }))
+            let fut = async move {
+                Ok(build_avro_arrow2_stream_inner(config, file_meta)
+                    .await?
+                    .boxed())
+            }
+            .boxed();
+            Ok(fut)
         }
     }
 }
