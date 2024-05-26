@@ -50,6 +50,12 @@ impl FromPyArrow for ScalarValue {
 
         Ok(scalar)
     }
+
+    fn from_pyarrow_bound(
+        _: &pyo3::Bound<'_, PyAny>,
+    ) -> std::result::Result<Self, PyErr> {
+        todo!()
+    }
 }
 
 impl ToPyArrow for ScalarValue {
@@ -98,7 +104,7 @@ mod tests {
                 let executable: String = executable.extract().unwrap();
 
                 let python_path = locals.get_item("python_path").unwrap().unwrap();
-                let python_path: Vec<&str> = python_path.extract().unwrap();
+                let python_path: &str = python_path.extract().unwrap();
 
                 panic!("pyarrow not found\nExecutable: {executable}\nPython path: {python_path:?}\n\
                          HINT: try `pip install pyarrow`\n\

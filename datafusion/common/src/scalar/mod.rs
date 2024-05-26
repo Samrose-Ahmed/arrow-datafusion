@@ -2128,8 +2128,7 @@ impl ScalarValue {
             ScalarValue::Union(value, fields, _mode) => match value {
                 Some((v_id, value)) => {
                     let mut field_type_ids = Vec::<i8>::with_capacity(fields.len());
-                    let mut child_arrays =
-                        Vec::<(Field, ArrayRef)>::with_capacity(fields.len());
+                    let mut child_arrays = Vec::<ArrayRef>::with_capacity(fields.len());
                     for (f_id, field) in fields.iter() {
                         let ar = if f_id == *v_id {
                             value.to_array_of_size(size)?
@@ -2138,15 +2137,15 @@ impl ScalarValue {
                             new_null_array(dt, size)
                         };
                         let field = (**field).clone();
-                        child_arrays.push((field, ar));
+                        child_arrays.push(ar);
                         field_type_ids.push(f_id);
                     }
                     let type_ids = repeat(*v_id).take(size).collect::<Vec<_>>();
                     let type_ids = Buffer::from_slice_ref(type_ids);
-                    let value_offsets: Option<Buffer> = None;
+                    let value_offsets = None;
                     let ar = UnionArray::try_new(
-                        field_type_ids.as_slice(),
-                        type_ids,
+                        fields.clone(),
+                        arrow_buffer::ScalarBuffer::from(type_ids),
                         value_offsets,
                         child_arrays,
                     )
